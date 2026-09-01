@@ -3,7 +3,7 @@
   "id": "pynetree.workspace-order",
   "name": "Workspace Order",
   "version": "1.0.0",
-  "author": "Jake Pyne",
+  "author": "pynetreedev",
   "description": "Workspace indicators you can reorder by click or drag",
   "kinds": [
     "bar-widget"
