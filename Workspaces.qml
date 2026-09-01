@@ -462,7 +462,7 @@ BarWidget {
   readonly property int maxOutputBytes: 262144
   readonly property int maxItems: 512            // workspaces or monitors accepted from one read
   readonly property int maxNameChars: 256        // a retained workspace name is truncated to this
-  readonly property int probeTimeoutMs: 4000     // a hyprctl call that outlives this is abandoned
+  readonly property int probeTimeoutMs: 4000     // per-probe deadline; clamped to >= 1s in the command (bare `timeout 0` would disable it)
 
   // Parse a value as a base-10 integer only, rejecting floats, hex, whitespace
   // and anything non-numeric. Returns null on any deviation, so a malformed id
@@ -476,18 +476,48 @@ BarWidget {
 
   Process {
     id: probe
-    command: ["sh", "-c", "hyprctl -j workspaces | head -c " + root.maxOutputBytes]
-
-    // A hyprctl that hangs would otherwise pin the collector open forever.
-    onRunningChanged: if (running) probeWatchdog.restart(); else probeWatchdog.stop()
-    onExited: probeWatchdog.stop()
+    // `timeout` owns both the deadline and process-group termination. It runs
+    // the pipeline in its own process group and, on the deadline, sends SIGKILL
+    // to the WHOLE group -- reaping a hyprctl that hangs after (or without)
+    // output, which killing the shell alone does not: Quickshell's kill signals
+    // only its direct child, orphaning hyprctl/head and their inherited fd.
+    //
+    // Two consequences, both deliberate:
+    //  - QML must never kill this Process to enforce the deadline. SIGKILL to
+    //    `timeout` would orphan its group -- the same bug one level up, and
+    //    unfixable at any wrapper depth (nothing survives its own SIGKILL). So
+    //    the watchdog Timers are gone; timeout is the deadline.
+    //  - One residual remains and is disclosed rather than papered over: the
+    //    Process DESTRUCTOR (widget teardown / config reload / shell exit) calls
+    //    QProcess::kill() = SIGKILL on `timeout`, orphaning an in-flight group --
+    //    nothing bounds the orphan once timeout dies. A normal hyprctl has
+    //    already exited by then; a pathologically hung one is left unsupervised
+    //    and exits only when whatever it blocks on resolves (on shell exit the
+    //    compositor socket closes under it; on a config reload the compositor
+    //    stays up, so it can linger indefinitely). The window requires teardown
+    //    to race a probe's <=4s flight. setRunning(false) uses SIGTERM instead,
+    //    which timeout forwards to the group with its KILL deadline still armed,
+    //    so that path is safe.
+    //
+    // Overflow is the fast path, not an early kill: head -c closes the pipe at
+    // the cap and hyprctl usually exits on SIGPIPE -- but a producer that
+    // ignores SIGPIPE keeps the shell (and the collector fd) occupied until the
+    // deadline group-kill. Bounded occupancy, group-terminated.
+    // Math.max(1, ceil): always a positive whole number of seconds. `timeout 0`
+    // DISABLES the deadline entirely, so a future edit of probeTimeoutMs must
+    // never be able to produce 0 (or a fractional/locale-sensitive string).
+    command: ["timeout", "-s", "KILL", String(Math.max(1, Math.ceil(root.probeTimeoutMs / 1000))),
+              "sh", "-c", "hyprctl -j workspaces | head -c " + root.maxOutputBytes]
 
     stdout: StdioCollector {
       waitForEnd: true
 
       onStreamFinished: {
-        // head -c already bounds this; the length check is a belt-and-braces
-        // guard in case the platform lacks head.
+        // On a deadline group-kill the pipeline is SIGKILLed (shell-style status
+        // 137) with partial or empty stdout; JSON.parse then fails below and the
+        // update is skipped, keeping the last good data. head -c already bounds
+        // size; this length check is a belt-and-braces guard for a platform
+        // without head.
         if (!text || text.length > root.maxOutputBytes) return
 
         var counts = Object.create(null)
@@ -520,12 +550,6 @@ BarWidget {
     }
   }
 
-  Timer {
-    id: probeWatchdog
-    interval: root.probeTimeoutMs
-    onTriggered: if (probe.running) probe.running = false
-  }
-
   // Which workspace each monitor is actually showing. Quickshell's
   // monitor.activeWorkspace is right for switching -- that emits events it
   // handles -- but not across a renumber: the workspace you are standing on
@@ -535,16 +559,18 @@ BarWidget {
 
   Process {
     id: activeProbe
-    command: ["sh", "-c", "hyprctl -j monitors | head -c " + root.maxOutputBytes]
-
-    onRunningChanged: if (running) activeWatchdog.restart(); else activeWatchdog.stop()
-    onExited: activeWatchdog.stop()
+    // Same supervision contract as the workspace probe: timeout owns the
+    // deadline and group kill; QML never kills it (SIGKILL would orphan the
+    // group); the destructor-SIGKILL residual is disclosed at the workspace probe.
+    command: ["timeout", "-s", "KILL", String(Math.max(1, Math.ceil(root.probeTimeoutMs / 1000))),
+              "sh", "-c", "hyprctl -j monitors | head -c " + root.maxOutputBytes]
 
     stdout: StdioCollector {
       waitForEnd: true
 
       onStreamFinished: {
-        // Bounded by head -c on the producer; this is a secondary guard.
+        // Same as the workspace probe: a SIGKILL (status 137) yields partial or
+        // empty stdout, JSON.parse fails, the update is skipped. Secondary guard.
         if (!text || text.length > root.maxOutputBytes) return
 
         var active = Object.create(null)
@@ -571,12 +597,6 @@ BarWidget {
         root.revision++
       }
     }
-  }
-
-  Timer {
-    id: activeWatchdog
-    interval: root.probeTimeoutMs
-    onTriggered: if (activeProbe.running) activeProbe.running = false
   }
 
   // Coalesces bursts: one reorder is several id changes in a row, and a probe
