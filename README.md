@@ -35,9 +35,11 @@ a plugin cannot remove Hyprland configuration you wrote.
   It will not work on the classic config-file build.
 - **Omarchy Quattro** (the Quickshell shell), for the bar widget contract.
 - Nothing else. No runtime dependencies, no companion scripts, no files outside
-  the plugin directory. It shells out to `hyprctl`, plus the POSIX `sh` and the
-  coreutils `head` and `timeout` used to bound that output and its runtime at the source —
-  all part of any Omarchy base system, so there is nothing extra to install.
+  the plugin directory. It shells out to `hyprctl`, plus the POSIX `sh`, the
+  coreutils `head`, and `systemd-run` — which runs each probe in a transient
+  service bounded in output (`head -c`) and runtime (`RuntimeMaxSec`) under the
+  systemd **user** manager (running on any Omarchy system) — so there is nothing
+  extra to install.
 
 ## Use
 

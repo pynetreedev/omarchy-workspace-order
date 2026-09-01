@@ -462,7 +462,7 @@ BarWidget {
   readonly property int maxOutputBytes: 262144
   readonly property int maxItems: 512            // workspaces or monitors accepted from one read
   readonly property int maxNameChars: 256        // a retained workspace name is truncated to this
-  readonly property int probeTimeoutMs: 4000     // per-probe deadline; clamped to >= 1s in the command (bare `timeout 0` would disable it)
+  readonly property int probeTimeoutMs: 4000     // per-probe RuntimeMaxSec; clamped to >= 1s in the command (0 would mean no limit)
 
   // Parse a value as a base-10 integer only, rejecting floats, hex, whitespace
   // and anything non-numeric. Returns null on any deviation, so a malformed id
@@ -474,50 +474,86 @@ BarWidget {
     return parseInt(value, 10)
   }
 
+  // HYPRLAND_INSTANCE_SIGNATURE from OUR environment, so the probe carries it
+  // explicitly (see probeCommand): a systemd --user service is forked by the
+  // manager, not by us, and inherits the manager's env, not Quickshell's. On
+  // Omarchy (uwsm) the manager has it, but passing ours removes that coupling.
+  // Compositor-generated, not attacker-influenced.
+  readonly property string hyprSignature: Quickshell.env("HYPRLAND_INSTANCE_SIGNATURE") || ""
+
+  // The command both probes run, and the shape of it is driven by the marketplace
+  // security review. The reviewer required the probe bound to "a lifecycle
+  // boundary that survives parent teardown and kills all descendants, such as a
+  // cgroup/transient service with a runtime limit" -- so this is that transient
+  // service, their first-named mechanism, not a wrapper. A wrapper (`timeout`, a
+  // trap) is itself a process Quickshell's destructor can SIGKILL, orphaning what
+  // it supervised; a systemd --user service is a unit the manager owns, so it
+  // OUTLIVES the systemd-run client. Killing the client (which is what the Process
+  // destructor does on teardown / config reload / shell exit) does not stop it;
+  // RuntimeMaxSec still reaps the whole cgroup at the deadline. So a probe in
+  // flight at teardown is not reaped instantly -- it is BOUNDED at <= the
+  // deadline, which is exactly the runtime-limited guarantee the review accepts.
+  // The QML watchdog Timers are gone; the manager is the supervisor.
+  //
+  //   --pipe          run as a transient SERVICE with stdout relayed back through
+  //                   a pipe (not the journal). A service is also what lets
+  //                   LogLevelMax below apply at all: it is an exec property, so
+  //                   `systemd-run --scope -p LogLevelMax=...` fails outright
+  //                   ("Unknown assignment"), which -- with --quiet hiding the
+  //                   error -- is the real reason the scope variant produced no
+  //                   output. Only a service carries exec properties.
+  //   RuntimeMaxSec   the deadline, manager-enforced regardless of our process.
+  //                   Clamped to a positive whole second: RuntimeMaxSec=0 means NO
+  //                   limit, so a future probeTimeoutMs < 1000 must not reach it.
+  //   KillSignal=SIGKILL  answers the review's "kills ALL descendants" for an
+  //                   adversarial producer: RuntimeMaxSec stops a unit gracefully
+  //                   by default (SIGTERM, then SIGKILL only after the manager's
+  //                   ~90s stop timeout); SIGKILL makes the deadline reap the
+  //                   cgroup at once, so a SIGTERM/SIGPIPE-ignoring producer
+  //                   cannot linger.
+  //   LogLevelMax=notice  answers the review's "journal spam?" concern: without
+  //                   it the manager logs an info-level "Started ..." line once
+  //                   per probe -- ~2 journal lines per compositor event, forever.
+  //   --collect       garbage-collects the unit on every exit path (success,
+  //                   deadline-kill, failure), so no run-*.service accumulates.
+  //   Environment=    carry our HYPRLAND_INSTANCE_SIGNATURE into the manager-forked
+  //                   service so hyprctl finds the compositor socket (see above).
+  function probeCommand(target) {
+    // target is a fixed literal at both call sites; reject anything else up front
+    // so nothing arbitrary can reach the sh -c string below.
+    if (target !== "workspaces" && target !== "monitors")
+      return []
+
+    var cmd = ["systemd-run", "--user", "--pipe", "--quiet", "--collect",
+               "-p", "RuntimeMaxSec=" + String(Math.max(1, Math.ceil(root.probeTimeoutMs / 1000))),
+               "-p", "KillSignal=SIGKILL",
+               "-p", "LogLevelMax=notice"]
+
+    // Only pass the signature when it matches the safe grammar. systemd's
+    // Environment= is itself a mini-language (space-separated assignments,
+    // quoting), so a value with whitespace or quotes could reparse as something
+    // else. The real signature is hex_timestamp_timestamp; anything else is
+    // dropped and the manager-env fallback covers it.
+    if (/^[0-9A-Za-z_]+$/.test(root.hyprSignature))
+      cmd.push("-p", "Environment=HYPRLAND_INSTANCE_SIGNATURE=" + root.hyprSignature)
+
+    cmd.push("--", "sh", "-c", "hyprctl -j " + target + " | head -c " + root.maxOutputBytes)
+    return cmd
+  }
+
   Process {
     id: probe
-    // `timeout` owns both the deadline and process-group termination. It runs
-    // the pipeline in its own process group and, on the deadline, sends SIGKILL
-    // to the WHOLE group -- reaping a hyprctl that hangs after (or without)
-    // output, which killing the shell alone does not: Quickshell's kill signals
-    // only its direct child, orphaning hyprctl/head and their inherited fd.
-    //
-    // Two consequences, both deliberate:
-    //  - QML must never kill this Process to enforce the deadline. SIGKILL to
-    //    `timeout` would orphan its group -- the same bug one level up, and
-    //    unfixable at any wrapper depth (nothing survives its own SIGKILL). So
-    //    the watchdog Timers are gone; timeout is the deadline.
-    //  - One residual remains and is disclosed rather than papered over: the
-    //    Process DESTRUCTOR (widget teardown / config reload / shell exit) calls
-    //    QProcess::kill() = SIGKILL on `timeout`, orphaning an in-flight group --
-    //    nothing bounds the orphan once timeout dies. A normal hyprctl has
-    //    already exited by then; a pathologically hung one is left unsupervised
-    //    and exits only when whatever it blocks on resolves (on shell exit the
-    //    compositor socket closes under it; on a config reload the compositor
-    //    stays up, so it can linger indefinitely). The window requires teardown
-    //    to race a probe's <=4s flight. setRunning(false) uses SIGTERM instead,
-    //    which timeout forwards to the group with its KILL deadline still armed,
-    //    so that path is safe.
-    //
-    // Overflow is the fast path, not an early kill: head -c closes the pipe at
-    // the cap and hyprctl usually exits on SIGPIPE -- but a producer that
-    // ignores SIGPIPE keeps the shell (and the collector fd) occupied until the
-    // deadline group-kill. Bounded occupancy, group-terminated.
-    // Math.max(1, ceil): always a positive whole number of seconds. `timeout 0`
-    // DISABLES the deadline entirely, so a future edit of probeTimeoutMs must
-    // never be able to produce 0 (or a fractional/locale-sensitive string).
-    command: ["timeout", "-s", "KILL", String(Math.max(1, Math.ceil(root.probeTimeoutMs / 1000))),
-              "sh", "-c", "hyprctl -j workspaces | head -c " + root.maxOutputBytes]
+    // See probeCommand() for the supervision contract. Both probes use it.
+    command: root.probeCommand("workspaces")
 
     stdout: StdioCollector {
       waitForEnd: true
 
       onStreamFinished: {
-        // On a deadline group-kill the pipeline is SIGKILLed (shell-style status
-        // 137) with partial or empty stdout; JSON.parse then fails below and the
-        // update is skipped, keeping the last good data. head -c already bounds
-        // size; this length check is a belt-and-braces guard for a platform
-        // without head.
+        // When systemd reaps the service at the deadline the read ends with partial
+        // or empty stdout; JSON.parse then fails below and the update is skipped,
+        // keeping the last good data. head -c already bounds size; this length
+        // check is a belt-and-braces guard for a platform without head.
         if (!text || text.length > root.maxOutputBytes) return
 
         var counts = Object.create(null)
@@ -559,18 +595,15 @@ BarWidget {
 
   Process {
     id: activeProbe
-    // Same supervision contract as the workspace probe: timeout owns the
-    // deadline and group kill; QML never kills it (SIGKILL would orphan the
-    // group); the destructor-SIGKILL residual is disclosed at the workspace probe.
-    command: ["timeout", "-s", "KILL", String(Math.max(1, Math.ceil(root.probeTimeoutMs / 1000))),
-              "sh", "-c", "hyprctl -j monitors | head -c " + root.maxOutputBytes]
+    // Same supervision contract as the workspace probe -- see probeCommand().
+    command: root.probeCommand("monitors")
 
     stdout: StdioCollector {
       waitForEnd: true
 
       onStreamFinished: {
-        // Same as the workspace probe: a SIGKILL (status 137) yields partial or
-        // empty stdout, JSON.parse fails, the update is skipped. Secondary guard.
+        // Same as the workspace probe: a reaped service yields partial or empty
+        // stdout, JSON.parse fails, the update is skipped. Secondary size guard.
         if (!text || text.length > root.maxOutputBytes) return
 
         var active = Object.create(null)
