@@ -139,12 +139,50 @@ BarWidget {
     return "hyprctl dispatch " + Util.shellQuote(code)
   }
 
+  // Encode an arbitrary string as a Lua string literal, quotes included.
+  //
+  // Util.shellQuote() guards the OUTER shell word; it knows nothing about the
+  // Lua the compositor parses inside it. A workspace name is attacker-influenced
+  // -- any application can rename a workspace to whatever it likes -- so a name
+  // containing a quote, a backslash or a brace would otherwise break out of the
+  // string and become live Lua. Every byte outside a small printable-ASCII set
+  // is emitted as a \ddd decimal escape, which Lua accepts anywhere in a
+  // string and which cannot itself carry syntax, so the result is inert no
+  // matter what the name holds.
+  function luaString(value) {
+    var s = String(value)
+    var out = '"'
+
+    for (var i = 0; i < s.length; i++) {
+      var c = s.charCodeAt(i)
+
+      // Printable ASCII except the two characters that end or escape a Lua
+      // string. Everything else -- quotes, backslashes, control characters,
+      // and any code point above 126, including anything multi-byte -- goes
+      // out as a numeric escape.
+      if (c >= 32 && c <= 126 && c !== 34 && c !== 92) {
+        out += s.charAt(i)
+      } else if (c <= 255) {
+        out += "\\" + c
+      } else {
+        // Emit the UTF-8 bytes of a higher code point as individual escapes,
+        // so the name round-trips rather than being mangled or truncated.
+        var bytes = unescape(encodeURIComponent(s.charAt(i)))
+        for (var b = 0; b < bytes.length; b++) out += "\\" + bytes.charCodeAt(b)
+      }
+    }
+
+    return out + '"'
+  }
+
   function renameStep(id, name) {
-    return root.lua('hl.dsp.workspace.rename({ workspace = "' + id + '", name = "' + name + '" })')
+    return root.lua('hl.dsp.workspace.rename({ workspace = ' + root.luaString(String(id))
+      + ', name = ' + root.luaString(name) + ' })')
   }
 
   function changeStep(from, to) {
-    return root.lua('hl.dsp.workspace.change_id({ workspace = "' + from + '", id = ' + to + ' })')
+    return root.lua('hl.dsp.workspace.change_id({ workspace = ' + root.luaString(String(from))
+      + ', id = ' + to + ' })')
   }
 
   // The name a workspace should carry once it has landed on `to`.
