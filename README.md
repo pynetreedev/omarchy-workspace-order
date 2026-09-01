@@ -100,6 +100,12 @@ Quickshell does model correctly, but taking that from one source and the rest
 from another leaves the selected marker stranded on the pill you just left, so
 it all comes from the same place.
 
+## Tests
+
+`test/` holds regression coverage for the workspace-name encoder, the one place
+untrusted input reaches the compositor's Lua parser. Run with `node --test test/`.
+It is developer tooling and plays no part in the installed plugin.
+
 ## Limitations
 
 - Swaps stay within one monitor's block. Moving a workspace to another display
