@@ -119,7 +119,7 @@ BarWidget {
   // plain focus dispatch lands on the right screen.
   function focusWorkspace(id) {
     if (!root.bar) return
-    root.bar.run("hyprctl dispatch " + Util.shellQuote("hl.dsp.focus({ workspace = \"" + id + "\" })"))
+    root.bar.run(root.lua('hl.dsp.focus({ workspace = ' + root.luaString(String(id)) + ' })'))
   }
 
   // Renumbering, done here rather than shelled out to a helper, so the plugin
@@ -143,33 +143,41 @@ BarWidget {
   //
   // Util.shellQuote() guards the OUTER shell word; it knows nothing about the
   // Lua the compositor parses inside it. A workspace name is attacker-influenced
-  // -- any application can rename a workspace to whatever it likes -- so a name
-  // containing a quote, a backslash or a brace would otherwise break out of the
-  // string and become live Lua. Every byte outside a small printable-ASCII set
-  // is emitted as a \ddd decimal escape, which Lua accepts anywhere in a
-  // string and which cannot itself carry syntax, so the result is inert no
-  // matter what the name holds.
+  // -- any application can rename a workspace -- so a name containing a quote, a
+  // backslash or a brace would otherwise break out of the string and become
+  // live Lua.
+  //
+  // Two subtleties the naive version got wrong:
+  //   - Escapes are FIXED three digits (\034, not \34). Lua reads at most
+  //     three decimal digits after a backslash, so a variable-width \34 in
+  //     front of a literal "5" would be read as the single escape \345.
+  //   - Iteration is over Unicode CODE POINTS, not UTF-16 units, and UTF-8 is
+  //     encoded by hand. An emoji is a surrogate pair; charAt() on half of one
+  //     yields a lone surrogate that encodeURIComponent() throws on. A lone or
+  //     unpaired surrogate has no valid UTF-8 and is replaced with U+FFFD so the
+  //     output stays well-formed and inert.
   function luaString(value) {
     var s = String(value)
     var out = '"'
 
     for (var i = 0; i < s.length; i++) {
-      var c = s.charCodeAt(i)
+      var cp = s.codePointAt(i)
 
-      // Printable ASCII except the two characters that end or escape a Lua
-      // string. Everything else -- quotes, backslashes, control characters,
-      // and any code point above 126, including anything multi-byte -- goes
-      // out as a numeric escape.
-      if (c >= 32 && c <= 126 && c !== 34 && c !== 92) {
+      if (cp >= 32 && cp <= 126 && cp !== 34 && cp !== 92) {
         out += s.charAt(i)
-      } else if (c <= 255) {
-        out += "\\" + c
-      } else {
-        // Emit the UTF-8 bytes of a higher code point as individual escapes,
-        // so the name round-trips rather than being mangled or truncated.
-        var bytes = unescape(encodeURIComponent(s.charAt(i)))
-        for (var b = 0; b < bytes.length; b++) out += "\\" + bytes.charCodeAt(b)
+        continue
       }
+
+      if (cp > 0xFFFF) i++
+      if (cp >= 0xD800 && cp <= 0xDFFF) cp = 0xFFFD
+
+      var bytes
+      if (cp <= 0x7F) bytes = [cp]
+      else if (cp <= 0x7FF) bytes = [0xC0 | (cp >> 6), 0x80 | (cp & 0x3F)]
+      else if (cp <= 0xFFFF) bytes = [0xE0 | (cp >> 12), 0x80 | ((cp >> 6) & 0x3F), 0x80 | (cp & 0x3F)]
+      else bytes = [0xF0 | (cp >> 18), 0x80 | ((cp >> 12) & 0x3F), 0x80 | ((cp >> 6) & 0x3F), 0x80 | (cp & 0x3F)]
+
+      for (var b = 0; b < bytes.length; b++) out += "\\" + ("00" + bytes[b]).slice(-3)
     }
 
     return out + '"'
@@ -181,8 +189,13 @@ BarWidget {
   }
 
   function changeStep(from, to) {
+    // `to` is always an id we computed, but force it to a plain integer so a
+    // stray float or NaN cannot become a bare token in the dispatched Lua.
+    var id = Math.trunc(Number(to))
+    if (!isFinite(id)) return ""
+
     return root.lua('hl.dsp.workspace.change_id({ workspace = ' + root.luaString(String(from))
-      + ', id = ' + to + ' })')
+      + ', id = ' + id + ' })')
   }
 
   // The name a workspace should carry once it has landed on `to`.
@@ -220,7 +233,7 @@ BarWidget {
       steps.push(changeStep(scratch, b), renameStep(b, nameAtB))
     }
 
-    root.bar.run(steps.join(" ; "))
+    root.bar.run(steps.filter(function(x) { return x !== "" }).join(" ; "))
   }
 
   // Toggled by a Hyprland keybinding through the IPC handler below. While off,
@@ -281,6 +294,8 @@ BarWidget {
         case "workspacev2":
         case "focusedmon":
         case "focusedmonv2":
+        case "renameworkspace":
+        case "renameworkspacev2":
           debounce.restart()
           break
       }
@@ -437,25 +452,57 @@ BarWidget {
   property var liveCounts: ({})
   property var liveNames: ({})
 
+  // Bounds on anything read from the compositor. hyprctl output is trusted only
+  // as far as the compositor is; workspace names within it are set by arbitrary
+  // applications and then held in this long-lived shell, so everything is capped
+  // rather than accepted on faith.
+  readonly property int maxOutputBytes: 262144   // 256 KiB of JSON is far more than any real setup emits
+  readonly property int maxItems: 512            // workspaces or monitors accepted from one read
+  readonly property int maxNameChars: 256        // a retained workspace name is truncated to this
+  readonly property int probeTimeoutMs: 4000     // a hyprctl call that outlives this is abandoned
+
+  // Parse a value as a base-10 integer only, rejecting floats, hex, whitespace
+  // and anything non-numeric. Returns null on any deviation, so a malformed id
+  // or count is dropped rather than coerced.
+  function strictInt(value) {
+    if (typeof value === "number") return Number.isInteger(value) ? value : null
+    if (typeof value !== "string") return null
+    if (!/^-?\d{1,9}$/.test(value)) return null
+    return parseInt(value, 10)
+  }
+
   Process {
     id: probe
     command: ["hyprctl", "-j", "workspaces"]
+
+    // A hyprctl that hangs would otherwise pin the collector open forever.
+    onRunningChanged: if (running) probeWatchdog.restart(); else probeWatchdog.stop()
+    onExited: probeWatchdog.stop()
 
     stdout: StdioCollector {
       waitForEnd: true
 
       onStreamFinished: {
+        if (!text || text.length > root.maxOutputBytes) return
+
         var counts = {}
         var names = {}
 
         try {
-          var list = JSON.parse(String(text || "[]"))
+          var list = JSON.parse(String(text))
+          if (!Array.isArray(list)) return
 
-          for (var i = 0; i < list.length; i++) {
-            if (list[i].id > 0) {
-              counts[list[i].id] = list[i].windows
-              names[list[i].id] = String(list[i].name)
-            }
+          var n = Math.min(list.length, root.maxItems)
+          for (var i = 0; i < n; i++) {
+            var item = list[i]
+            if (!item) continue
+
+            var id = root.strictInt(item.id)
+            if (id === null || id <= 0 || id > 1000000) continue
+
+            var windows = root.strictInt(item.windows)
+            counts[id] = windows === null || windows < 0 ? 0 : windows
+            names[id] = String(item.name === undefined ? id : item.name).slice(0, root.maxNameChars)
           }
         } catch (e) {
           return
@@ -466,6 +513,12 @@ BarWidget {
         root.revision++
       }
     }
+  }
+
+  Timer {
+    id: probeWatchdog
+    interval: root.probeTimeoutMs
+    onTriggered: if (probe.running) probe.running = false
   }
 
   // Which workspace each monitor is actually showing. Quickshell's
@@ -479,19 +532,30 @@ BarWidget {
     id: activeProbe
     command: ["hyprctl", "-j", "monitors"]
 
+    onRunningChanged: if (running) activeWatchdog.restart(); else activeWatchdog.stop()
+    onExited: activeWatchdog.stop()
+
     stdout: StdioCollector {
       waitForEnd: true
 
       onStreamFinished: {
+        if (!text || text.length > root.maxOutputBytes) return
+
         var active = {}
 
         try {
-          var list = JSON.parse(String(text || "[]"))
+          var list = JSON.parse(String(text))
+          if (!Array.isArray(list)) return
 
-          for (var i = 0; i < list.length; i++) {
-            if (list[i].name && list[i].activeWorkspace) {
-              active[list[i].name] = list[i].activeWorkspace.id
-            }
+          var n = Math.min(list.length, root.maxItems)
+          for (var i = 0; i < n; i++) {
+            var item = list[i]
+            if (!item || !item.name || !item.activeWorkspace) continue
+
+            var id = root.strictInt(item.activeWorkspace.id)
+            if (id === null || id <= 0 || id > 1000000) continue
+
+            active[String(item.name).slice(0, root.maxNameChars)] = id
           }
         } catch (e) {
           return
@@ -501,6 +565,12 @@ BarWidget {
         root.revision++
       }
     }
+  }
+
+  Timer {
+    id: activeWatchdog
+    interval: root.probeTimeoutMs
+    onTriggered: if (activeProbe.running) activeProbe.running = false
   }
 
   // Coalesces bursts: one reorder is several id changes in a row, and a probe
