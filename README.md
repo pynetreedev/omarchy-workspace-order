@@ -19,6 +19,24 @@ Then bind the mode to a key in `~/.config/hypr/bindings.lua`:
 o.bind("SUPER + M", "Workspace order mode", "omarchy-shell -q workspace-order toggle")
 ```
 
+## Remove
+
+```bash
+omarchy plugin remove pynetree.workspace-order
+```
+
+That unloads the widget and takes its entry out of your bar. If you added the
+keybinding above, delete that line from `~/.config/hypr/bindings.lua` as well —
+a plugin cannot remove Hyprland configuration you wrote.
+
+## Requirements
+
+- **Hyprland 0.56+ with the Lua config API**, for `hl.dsp.workspace.change_id`.
+  It will not work on the classic config-file build.
+- **Omarchy Quattro** (the Quickshell shell), for the bar widget contract.
+- Nothing else. No runtime dependencies, no companion scripts, no files outside
+  the plugin directory. It shells out only to `hyprctl`, which Hyprland ships.
+
 ## Use
 
 | Gesture | Effect |
