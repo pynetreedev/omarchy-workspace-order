@@ -449,14 +449,17 @@ BarWidget {
   //
   // Focus is still taken from Quickshell: workspace switches emit events it
   // does handle, and that half has always tracked correctly.
-  property var liveCounts: ({})
-  property var liveNames: ({})
+  property var liveCounts: Object.create(null)
+  property var liveNames: Object.create(null)
 
   // Bounds on anything read from the compositor. hyprctl output is trusted only
   // as far as the compositor is; workspace names within it are set by arbitrary
   // applications and then held in this long-lived shell, so everything is capped
   // rather than accepted on faith.
-  readonly property int maxOutputBytes: 262144   // 256 KiB of JSON is far more than any real setup emits
+  // Producer-side byte cap: each probe pipes hyprctl through `head -c`, so the
+  // pipe closes at this many bytes and the collector can never buffer more --
+  // the bound holds before decoding, not after. Real output is a few KB.
+  readonly property int maxOutputBytes: 262144
   readonly property int maxItems: 512            // workspaces or monitors accepted from one read
   readonly property int maxNameChars: 256        // a retained workspace name is truncated to this
   readonly property int probeTimeoutMs: 4000     // a hyprctl call that outlives this is abandoned
@@ -473,7 +476,7 @@ BarWidget {
 
   Process {
     id: probe
-    command: ["hyprctl", "-j", "workspaces"]
+    command: ["sh", "-c", "hyprctl -j workspaces | head -c " + root.maxOutputBytes]
 
     // A hyprctl that hangs would otherwise pin the collector open forever.
     onRunningChanged: if (running) probeWatchdog.restart(); else probeWatchdog.stop()
@@ -483,10 +486,12 @@ BarWidget {
       waitForEnd: true
 
       onStreamFinished: {
+        // head -c already bounds this; the length check is a belt-and-braces
+        // guard in case the platform lacks head.
         if (!text || text.length > root.maxOutputBytes) return
 
-        var counts = {}
-        var names = {}
+        var counts = Object.create(null)
+        var names = Object.create(null)
 
         try {
           var list = JSON.parse(String(text))
@@ -526,11 +531,11 @@ BarWidget {
   // handles -- but not across a renumber: the workspace you are standing on
   // changes id with no event, so the object it holds keeps the old number and
   // the selected marker stays on the pill you just left.
-  property var liveActive: ({})
+  property var liveActive: Object.create(null)
 
   Process {
     id: activeProbe
-    command: ["hyprctl", "-j", "monitors"]
+    command: ["sh", "-c", "hyprctl -j monitors | head -c " + root.maxOutputBytes]
 
     onRunningChanged: if (running) activeWatchdog.restart(); else activeWatchdog.stop()
     onExited: activeWatchdog.stop()
@@ -539,9 +544,10 @@ BarWidget {
       waitForEnd: true
 
       onStreamFinished: {
+        // Bounded by head -c on the producer; this is a secondary guard.
         if (!text || text.length > root.maxOutputBytes) return
 
-        var active = {}
+        var active = Object.create(null)
 
         try {
           var list = JSON.parse(String(text))
