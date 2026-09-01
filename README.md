@@ -22,7 +22,7 @@ o.bind("SUPER + M", "Workspace order mode", "omarchy-shell -q workspace-order to
 ## Remove
 
 ```bash
-omarchy plugin remove pynetree.workspace-order
+omarchy plugin remove pynetreedev.workspace-order
 ```
 
 That unloads the widget and takes its entry out of your bar. If you added the
